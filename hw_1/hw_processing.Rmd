@@ -1,0 +1,206 @@
+---
+title: "Gene expresson course. Task 1. Microarrays analysis."
+output:
+  html_document:
+    df_print: paged
+---
+
+## Homework 1: _deadline November 21st_
+
+The first homework is to analyze a microarray gene expression dataset. All the datasets will be available by GEO id, so you can find them at GEO omnibus and also use `GEOquery::getGEO("GSEXXXXX")` to get the expression data into R session.
+
+Basically you needed to perform basic steps for a dataset: normalize and make sense of the PCA plot. Then you need to design differential expression to address the general question for your homework. Once you perform DE I want you to highlight genes that are different and perform pathway enrichment.
+
+
+__My dataset__: `GSE30854`
+
+__Short info__:
+Fecal microbial infusion from lean donors increases insulin sensitivity in subjects with metabolic syndrome
+
+Organism:	Homo sapiens
+
+Experiment type:	Expression profiling by array
+
+Full information [here](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE30854)
+
+My question: `Do autologous and  allogenic patients respond differently to treatment?`.
+
+The platform is quite good, it was used for analysing 25745 samples.
+
+#№# Importing libraries
+
+```{r setup, message=FALSE} 
+library(GEOquery)
+library(Biobase)
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(MASS)
+library(data.table)
+library(sva)
+```
+
+## Preprocessing
+
+### Loading the dataset
+```{r message=FALSE}
+data <- getGEO("GSE30854", AnnotGPL = TRUE)[[1]]
+head(pData(data))
+```
+```{r}
+geo_data <- data
+```
+
+
+### Filtering pData
+```{r message=FALSE}
+colnames(pData(geo_data))
+```
+
+```{r}
+pData(geo_data) <- pData(geo_data)[, c("title", "fecal microbial transplant type:ch1", "sample id:ch1","disease state:ch1", "Stage:ch1", "description")]
+pData(geo_data) <- cbind(pData(geo_data), transpose(strsplit(pData(geo_data)[, c("title")], " ")))
+pData(geo_data) <- pData(geo_data)[,1:(length(pData(geo_data))-1)]
+colnames(pData(geo_data)) <- c("title", "type",  "sample_id",  "disease", "stage", "description", "experiment")
+
+pData(geo_data)$sample_id <- gsub("Tech_replicate_","",pData(geo_data)$sample_id)
+
+pData(geo_data)$sample_id <- gsub("_","",pData(geo_data)$sample_id)
+
+head(pData(geo_data))
+```
+
+```{r}
+
+head(pData(geo_data))
+```
+
+### Filtering fData
+```{r}
+colnames(fData(geo_data))
+```
+
+```{r}
+## ----message=F------------------------------------------------------------------------
+fData(geo_data) <- fData(geo_data)[, c("ID", "Gene symbol", "Gene ID")]
+head(fData(geo_data))
+```
+## Normalization
+```{r fig.height=3}
+ggplot(data=data.frame(expression=exprs(geo_data)[, 1]),
+       aes(x=expression)) +
+  geom_histogram()
+```
+
+Dataset is not normalized => Let's do it!
+
+```{r fig.height=3}
+ggplot(data=data.frame(expression_log2=log2(exprs(geo_data) [, 1])),
+       aes(x=expression_log2)) +
+  geom_histogram()
+
+```
+```{r}
+min(exprs(geo_data))
+```
+
+It's not a normal distribution, mode is near zero. 
+
+Try quantile normalization:
+
+```{r fig.height=3}
+ggplot(data=data.frame(expression_log2=normalizeBetweenArrays(log2(exprs(geo_data)+1), method="quantile") [, 1]),
+       aes(x=expression_log2)) +
+  geom_histogram()
+```
+ Okayy, let's do that:
+
+```{r fig.height=3}
+exprs(geo_data) <- normalizeBetweenArrays(log2(exprs(geo_data)+1), method="quantile")
+twoSamples <- melt(exprs(geo_data[, 1:2]))
+
+ggplot(data=twoSamples, aes(x=value)) +
+  facet_grid(~Var2) + geom_histogram()
+```
+
+Now distribution between 2 samples is tha same:) Good!
+
+## From MA to genes
+
+```{r}
+geo_data <- geo_data[!grepl("///", fData(geo_data)$`Gene symbol`), ]
+geo_data <- geo_data[fData(geo_data)$`Gene symbol` != "", ]
+
+fData(geo_data)$mean_expression <- apply(exprs(geo_data), 1, mean)
+geo_data <- geo_data[order(fData(geo_data)$mean_expression, decreasing = TRUE), ]
+geo_data <- geo_data[!duplicated(fData(geo_data)$`Gene ID`), ]
+geo_data <- geo_data[seq_len(12000), ]
+dim(geo_data)
+```
+## PCA
+
+
+```{r fig.height=4}
+
+pcas <- prcomp(t(exprs(geo_data)), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+```
+
+
+```{r fig.height=4}
+pcas <- prcomp(t(exprs(geo_data)), scale. = T)
+    plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+    ggplot(plotData, aes(x=PC1, y=PC2, color=sample_id, shape = stage)) +
+      geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+
+```
+
+```{r}
+variance <- pcas$sdev^2
+variance <- variance / sum(variance)
+ggplot(data=data.frame(component=1:46, percent=variance * 100),
+       aes(x=component, y=percent)) +
+  geom_point() + geom_line() + theme_bw()
+```
+
+Bad news! We can not divide them by autologous/allogenic or before treatment(baseline)/after treatment.
+
+But it is divided well by specific human (and  before treatment(baseline)/after treatment). That mean, that differences in specific people contribute more than differences in changing their microbiome.
+
+And we have one outlier, BUT FIRST, batch normalization!
+
+
+
+```{r}
+batch <- pData(geo_data)$sample_id
+modcombat <- model.matrix(~1, data=pData(geo_data))
+combat_geo_data = ComBat(dat=exprs(geo_data), batch=batch, mod=modcombat)
+
+pcas <- prcomp(t(combat_geo_data), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+variance <- pcas$sdev^2
+variance <- variance / sum(variance)
+ggplot(data=data.frame(component=1:46, percent=variance * 100),
+       aes(x=component, y=percent)) +
+  geom_point() + geom_line() + theme_bw()
+```
+
+A little better. Kostya said, we have to take `pData(geo_data)$sample_id` into account. Okayy, Let's design experiment.
+
+This is an [R Markdown](http://rmarkdown.rstudio.com) Notebook. When you execute code within the notebook, the results appear beneath the code. 
+
+Try executing this chunk by clicking the *Run* button within the chunk or by placing your cursor inside it and pressing *Ctrl+Shift+Enter*. 
+
+
+Add a new chunk by clicking the *Insert Chunk* button on the toolbar or by pressing *Ctrl+Alt+I*.
+
+When you save the notebook, an HTML file containing the code and output will be saved alongside it (click the *Preview* button or press *Ctrl+Shift+K* to preview the HTML file).
+
+The preview shows you a rendered HTML copy of the contents of the editor. Consequently, unlike *Knit*, *Preview* does not run any R code chunks. Instead, the output of the chunk when it was last run in the editor is displayed.

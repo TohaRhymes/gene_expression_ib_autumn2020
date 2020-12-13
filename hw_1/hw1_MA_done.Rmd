@@ -1,0 +1,362 @@
+---
+title: "Gene expresson course. Task 1. Microarrays analysis."
+output:
+  html_document:
+    df_print: paged
+---
+
+## Homework 1: _deadline November 21st_
+
+The first homework is to analyze a microarray gene expression dataset. All the datasets will be available by GEO id, so you can find them at GEO omnibus and also use `GEOquery::getGEO("GSEXXXXX")` to get the expression data into R session.
+
+Basically you needed to perform basic steps for a dataset: normalize and make sense of the PCA plot. Then you need to design differential expression to address the general question for your homework. Once you perform DE I want you to highlight genes that are different and perform pathway enrichment.
+
+
+__My dataset__: `GSE30854`
+
+__Short info__:
+Fecal microbial infusion from lean donors increases insulin sensitivity in subjects with metabolic syndrome
+
+Organism:	Homo sapiens
+
+Experiment type:	Expression profiling by array
+
+Full information [here](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE30854)
+
+My question: `Do autologous and  allogenic patients respond differently to treatment?`.
+
+The platform is quite good, it was used for analysing 25745 samples.
+
+#№# Importing libraries
+
+```{r setup, message=FALSE} 
+library(GEOquery)
+library(Biobase)
+library(ggplot2)
+library(reshape2)
+library(limma)
+library(MASS)
+library(data.table)
+library(sva)
+library(pheatmap)
+library(RColorBrewer)
+library(ggrepel)
+library(dplyr)
+library(fgsea)
+```
+
+## Preprocessing
+
+### Loading the dataset
+```{r message=FALSE}
+data <- getGEO("GSE30854", AnnotGPL = TRUE)[[1]]
+head(pData(data))
+```
+```{r message=FALSE}
+geo_data <- data
+```
+
+
+### Filtering pData
+```{r message=FALSE}
+colnames(pData(geo_data))
+```
+
+```{r message=FALSE}
+pData(geo_data) <- pData(geo_data)[, c("title","geo_accession", "fecal microbial transplant type:ch1", "sample id:ch1","disease state:ch1", "Stage:ch1", "description")]
+pData(geo_data) <- cbind(pData(geo_data), transpose(strsplit(pData(geo_data)[, c("title")], " ")))
+pData(geo_data) <- pData(geo_data)[,1:(length(pData(geo_data))-1)]
+colnames(pData(geo_data)) <- c("title", "geo", "type",  "sample_id",  "disease", "stage", "description", "experiment")
+
+pData(geo_data)$sample_id <- gsub("Tech_replicate_","",pData(geo_data)$sample_id)
+
+pData(geo_data)$sample_id <- gsub("_","",pData(geo_data)$sample_id)
+
+head(pData(geo_data))
+```
+
+
+### Filtering fData
+```{r message=FALSE}
+colnames(fData(geo_data))
+```
+
+```{r message=FALSE}
+## ----message=F------------------------------------------------------------------------
+fData(geo_data) <- fData(geo_data)[, c("ID", "Gene symbol", "Gene ID")]
+head(fData(geo_data))
+```
+## Normalization
+```{r fig.height=3, message=FALSE}
+ggplot(data=data.frame(expression=exprs(geo_data)[, 1]),
+       aes(x=expression)) +
+  geom_histogram()
+```
+
+Dataset is not normalized => Let's do it!
+
+```{r fig.height=3, message=FALSE}
+ggplot(data=data.frame(expression_log2=log2(exprs(geo_data) [, 1])),
+       aes(x=expression_log2)) +
+  geom_histogram()
+
+```
+```{r message=FALSE}
+min(exprs(geo_data))
+```
+
+It's not a normal distribution, mode is near zero. 
+
+Try quantile normalization:
+
+```{r fig.height=3, message=FALSE}
+ggplot(data=data.frame(expression_log2=normalizeBetweenArrays(log2(exprs(geo_data)+1), method="quantile") [, 1]),
+       aes(x=expression_log2)) +
+  geom_histogram()
+```
+ Okayy, let's do that:
+
+```{r fig.height=3, message=FALSE}
+exprs(geo_data) <- normalizeBetweenArrays(log2(exprs(geo_data)+1), method="quantile")
+twoSamples <- melt(exprs(geo_data[, 1:2]))
+
+ggplot(data=twoSamples, aes(x=value)) +
+  facet_grid(~Var2) + geom_histogram()
+```
+
+Now distribution between 2 samples is tha same:) Good!
+
+## From MA to genes
+
+```{r message=FALSE}
+geo_data <- geo_data[!grepl("///", fData(geo_data)$`Gene symbol`), ]
+geo_data <- geo_data[fData(geo_data)$`Gene symbol` != "", ]
+
+fData(geo_data)$mean_expression <- apply(exprs(geo_data), 1, mean)
+geo_data <- geo_data[order(fData(geo_data)$mean_expression, decreasing = TRUE), ]
+geo_data <- geo_data[!duplicated(fData(geo_data)$`Gene ID`), ]
+geo_data <- geo_data[seq_len(12000), ]
+dim(geo_data)
+```
+## PCA
+
+
+```{r fig.height=4, message=FALSE}
+
+pcas <- prcomp(t(exprs(geo_data)), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+```
+We have one outlier, lets get it and delete:
+```{r message=FALSE}
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) + geom_text(aes(label=rownames(plotData)), nudge_x = -30, nudge_y = 0) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+```
+```{r message=FALSE}
+geo_data <- geo_data[,pData(geo_data)$geo != "GSM765521"]
+pcas <- prcomp(t(exprs(geo_data)), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+```
+
+Very nice!
+
+
+```{r fig.height=4, message=FALSE}
+pcas <- prcomp(t(exprs(geo_data)), scale. = T)
+    plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+    ggplot(plotData, aes(x=PC1, y=PC2, color=sample_id, shape = stage)) + geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+
+```
+
+```{r message=FALSE}
+variance <- pcas$sdev^2
+variance <- variance / sum(variance)
+ggplot(data=data.frame(component=1:45, percent=variance * 100),
+       aes(x=component, y=percent)) +
+  geom_point() + geom_line() + theme_bw()
+```
+
+Bad news! We can not divide them by autologous/allogenic or before treatment(baseline)/after treatment.
+
+But it is divided well by specific human (and  before treatment(baseline)/after treatment). That mean, that differences in specific people contribute more than differences in changing their microbiome.
+
+And we have one outlier, BUT FIRST, batch normalization!
+
+
+
+```{r message=F}
+batch <- pData(geo_data)$sample_id
+modcombat <- model.matrix(~1, data=pData(geo_data))
+combat_geo_data = ComBat(dat=exprs(geo_data), batch=batch, mod=modcombat)
+
+pcas <- prcomp(t(combat_geo_data), scale. = T)
+plotData <- cbind(pcas$x[, 1:2], pData(geo_data))
+ggplot(plotData, aes(x=PC1, y=PC2, color=experiment)) +
+  geom_point() + theme_bw() + theme(aspect.ratio = 1)
+
+variance <- pcas$sdev^2
+variance <- variance / sum(variance)
+ggplot(data=data.frame(component=1:45, percent=variance * 100),
+       aes(x=component, y=percent)) +
+  geom_point() + geom_line() + theme_bw()
+```
+
+A little better. Kostya said, we have to take `pData(geo_data)$sample_id` into account. Okayy, Let's design experiment.
+
+
+## Designing
+
+One more time, I will take `experiment` and `sample_id` into aсcount, when I perform DE.
+
+As I want to understand difference between 2 groups, I will make 2 comparisons: with treatment (allo) before/after, without treatment (auto) before/after, 
+
+#### Autologous (not changed (their own) microbiom)
+```{r message=FALSE}
+geo_auto <- geo_data[,pData(geo_data)$type == "Autologous"]
+pData(geo_auto)
+```
+
+```{r message=FALSE}
+auto_model <- model.matrix(~0 + experiment + sample_id, data = pData(geo_auto))
+colnames(auto_model)
+colnames(auto_model) <- c("auto_0", "auto_6", "p13", "p14", "p16", "p17", "p23", "p24")
+```
+
+
+```{r}
+fit <- lmFit(geo_auto, auto_model)
+fit2 <- contrasts.fit(fit, makeContrasts(auto_6 - auto_0, levels=auto_model))
+fit2 <- eBayes(fit2, trend = T)
+de <- topTable(fit2, adjust.method="BH", number=Inf, sort.by = "P")
+head(de)
+
+ggplot(de, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() +
+  geom_text_repel(data=de %>% dplyr::filter(adj.P.Val < 0.01), aes(label=Gene.symbol, color=NULL))
+```
+
+
+#### Allogenic (changed microbiom)
+
+```{r message=FALSE}
+geo_allo <- geo_data[,pData(geo_data)$type == "Allogenic"]
+pData(geo_allo)
+```
+
+
+```{r message=FALSE}
+allo_model <- model.matrix(~0 + experiment + sample_id, data = pData(geo_allo))
+colnames(allo_model)
+colnames(allo_model) <- c("allo_0", "allo_6", "p20", "p21", "p22", "p8")
+```
+
+```{r message=FALSE}
+
+fit <- lmFit(geo_allo, allo_model)
+fit2 <- contrasts.fit(fit, makeContrasts(allo_6 - allo_0, levels=allo_model))
+fit2 <- eBayes(fit2, trend = T)
+de <- topTable(fit2, adjust.method="BH", number=Inf, sort.by = "P")
+head(de)
+
+ggplot(de, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() +
+  geom_text_repel(data=de %>% dplyr::filter(adj.P.Val < 0.05), aes(label=Gene.symbol, color=NULL))
+```
+
+
+Bad news, we can't see almost any changes. 
+
+### Without splitting
+
+Let's try without splitting to 2 datasets:
+
+
+```{r message=FALSE}
+full_model <- model.matrix(~0 + experiment + sample_id, data = pData(geo_data))
+colnames(full_model)
+colnames(full_model) <- c("allo_0", "allo_6", "auto_0", "auto_6", "p12", "p13", "p14", "p16", "p17", "p20", "p21", "p22", "p23", "p24", "p8")
+```
+
+
+#### Allogenic
+```{r message=FALSE}
+fit <- lmFit(geo_data, full_model)
+fit2 <- contrasts.fit(fit, makeContrasts(allo_6 - allo_0, levels=full_model))
+fit2 <- eBayes(fit2, trend = T)
+de_al <- topTable(fit2, adjust.method="BH", number=Inf, sort.by = "P")
+head(de_al)
+
+ggplot(de_al, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() +
+  geom_text_repel(data=de_al %>% dplyr::filter(adj.P.Val < 0.05), aes(label=Gene.symbol, color=NULL))
+```
+#### Autologous
+```{r message=FALSE}
+
+fit <- lmFit(geo_data, full_model)
+fit2 <- contrasts.fit(fit, makeContrasts(auto_6 - auto_0, levels=full_model))
+fit2 <- eBayes(fit2, trend = T)
+de_au <- topTable(fit2, adjust.method="BH", number=Inf, sort.by = "P")
+head(de_au)
+
+ggplot(de_au, aes(x=logFC, y=-log10(adj.P.Val), color=adj.P.Val < 0.05)) +
+  geom_point() + theme_bw() +
+  geom_text_repel(data=de_au %>% dplyr::filter(adj.P.Val < 0.05), aes(label=Gene.symbol, color=NULL))
+```
+
+
+Wow, I think that's cool:
+
+* In allogenic patients (with changed microbiom) - we have a lot of DE genes, that means, that some processes have changed
+* In autologous patients (with their own microbiom) - we don't have much DE genes - almost all processes remained the same.
+
+Good!
+
+## Pathways
+
+Find affected pathways allogenic patients using `fgsea`
+
+```{r message=FALSE}
+load("keggSymbolHuman.rdata")
+stats <- de_al$t
+names(stats) <- de_al$Gene.symbol
+fgseaResults <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+# head(fgseaResults, 5)
+
+topPathwaysUp <- fgseaResults[ES > 0, ][head(order(pval), n=5), pathway]
+topPathwaysDown <- fgseaResults[ES < 0, ][head(order(pval), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+topPathways
+# plotGseaTable(keggSymbolHuman[topPathways], stats, fgseaResults, gseaParam = 0.5)
+```
+
+```{r message=FALSE}
+load("keggSymbolHuman.rdata")
+stats <- de_au$t
+names(stats) <- de_au$Gene.symbol
+fgseaResults <- fgseaMultilevel(keggSymbolHuman, stats, minSize = 15, maxSize = 500)
+# head(fgseaResults, 5)
+
+topPathwaysUp <- fgseaResults[ES > 0, ][head(order(pval), n=5), pathway]
+topPathwaysDown <- fgseaResults[ES < 0, ][head(order(pval), n=5), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+
+```
+
+## Analysis
+Back to the investigation.
+
+In patients with microbiota dysbiosis, top-1 and 2 upregulated pathways are `Drug metabolism`, `Metabolism of xenobiotics` - may be foreign substances had some drugs to which the body has no resistance.
+
+In patients with their own microbiota, we are observing just some random inner pathways, related to different hormones and cellural processes (and there is no significant genes on the volcano-plot, which means nothing is changed, there is no DE).
+
+That's it!
+
+(Kostya, sorry for my "biology":))
+
+
