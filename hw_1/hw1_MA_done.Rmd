@@ -27,7 +27,7 @@ My question: `Do autologous and  allogenic patients respond differently to treat
 
 The platform is quite good, it was used for analysing 25745 samples.
 
-#№# Importing libraries
+## Importing libraries
 
 ```{r setup, message=FALSE} 
 library(GEOquery)

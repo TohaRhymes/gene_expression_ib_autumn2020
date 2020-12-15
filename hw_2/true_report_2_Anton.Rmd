@@ -1,0 +1,184 @@
+---
+title: "Gene expresson course. Task 2. RNAseq analysis."
+output:
+  html_document:
+    df_print: paged
+---
+
+## Homework 1: _deadline December 14th_
+
+__Dataset__: [GSE114749](https://www.ncbi.nlm.nih.gov/geo/query/acc.cgi?acc=GSE114749)
+
+__Organism__: Mus musculus
+
+__Question__: Spleen vs small intestine
+
+
+
+
+
+```{r setup, message=FALSE}
+library(ggplot2)
+library(DESeq2)
+library(apeglm)
+library(ggrepel)
+library(dplyr)
+library(org.Mm.eg.db)
+library(fgsea)
+```
+
+
+# Читаем файлы
+```{r message=FALSE}
+
+files <- list.files("all_counts", full.names = T)
+files
+```
+
+```{r message=FALSE}
+counts <- lapply(files, function(countsFile) {
+  read.table(countsFile, sep="\t", header=1, row.names = 1, stringsAsFactors = F, 
+             comment.char = "", skip=1, 
+             col.names=c("Geneid", "Chr", "Start", "End", "Strand", "Length", "Count"))})
+```
+
+И создаем табличку:
+```{r message=FALSE}
+counts <- lapply(counts, function(countsTable) countsTable[, "Count", drop=F])
+counts <- do.call(cbind, counts)
+colnames(counts) <- gsub(".*(SRR\\d+).*", "\\1", files)
+head(counts)
+```
+```{r message=FALSE}
+dim(counts)
+```
+
+Переименую столбцы:
+```{r message=FALSE}
+rownames(counts) <- unlist(lapply(rownames(counts), function(x) gsub("(ENSMUSG\\d+)\\.\\d+", "\\1", x, perl=T)))
+head(counts)
+```
+```{r message=FALSE}
+counts$genes <- mapIds(org.Mm.eg.db, rownames(counts), column="SYMBOL", "ENSEMBL", multiVals = "first")
+```
+
+И пофильтрую (те, что не замапились, и те, которые все = 0): 
+```{r message=FALSE}
+filt_counts <- counts[!is.na(counts$genes),]
+filt_counts <- filt_counts[rowSums(filt_counts[1:6]) != 0, ]
+head(filt_counts)
+```
+
+Удалим дубликаты:
+```{r message=FALSE}
+filt_counts <- aggregate(.~genes,FUN = sum, filt_counts)
+```
+
+```{r message=FALSE}
+dim(filt_counts)
+```
+
+Отлично! Последний шаг:
+
+```{r message=FALSE}
+row.names(filt_counts) <- filt_counts$gene
+filt_counts$genes <- NULL
+filt_counts
+```
+
+## Взглянем на данные
+Посмотрим разброс значений размера библиотеки:
+```{r message=FALSE}
+ggplot(data=data.frame(librarySize=colSums(filt_counts)), aes(x=librarySize)) +
+  geom_histogram() + theme_bw() + scale_x_log10()
+```
+
+12.5-13.5 млн, неплохо, все близко.
+
+
+## Два вида клеток
+Разделим их
+
+```{r message=FALSE}
+data <- data.frame(
+  gsm=gsub(".*(SRR\\d+).*", "\\1", files),
+  organ=gsub(".*(SRR\\d+)_(spleen|intestine).*", "\\2", files),
+  row.names = gsub(".*(SRR\\d+).*", "\\1", files)
+)
+data
+```
+## DESeq
+
+
+```{r message=FALSE}
+dds <- DESeqDataSetFromMatrix(countData = filt_counts,
+                              colData = data,
+                              design= ~organ)
+keep <- rowSums(counts(dds)) >= 10
+dds <- dds[keep,]
+```
+```{r message=FALSE}
+dds <- DESeq(dds)
+res <- results(dds)
+```
+
+## Volcano
+```{r message=FALSE}
+res <- as.data.frame(res)
+res$gene <- rownames(res)
+ggplot(res, aes(x=log2FoldChange, y=-log10(padj), color=padj < 0.05)) +
+  geom_point() + theme_bw() + scale_color_manual(values=c("black", "red"))+
+  geom_text_repel(data=res %>% dplyr::filter(padj < 1e-70), aes(label=gene, color=NULL))
+```
+
+Волкано приплюснут, однако с огромным pvalue выделяется несколько десятков генов. Интересно посмотреть на enrichment.
+
+Стоит отметить самый ярковыделяющийся ген RET: регулирует межклеточные процессы и дифференциацию при органогенезе. Интересно, что в некардинально разделяющихся  транскриптомах такой ген есть.
+
+```{r message=FALSE}
+vsd <- vst(dds)
+plotPCA(vsd, intgroup=c("organ"))
+```
+
+На графике клетки хорошо разделяются по типу ткани (даже по первой компоненте). 
+
+## DE with LFC shrinkage
+
+
+```{r message=FALSE}
+load(file = "keggSymbolMouse.rdata")
+
+# Shrinkage
+res <- lfcShrink(dds, coef="organ_spleen_vs_intestine", type="apeglm")
+
+temp <- results(dds)
+res$stat <- temp$stat
+
+stats <- res$stat
+names(stats) <- rownames(res)
+stats <- stats[order(stats)]
+
+
+fgseaRes <- fgsea(pathways = keggSymbolMouse, 
+                    stats    = stats,
+                    minSize = 5,
+                    maxSize = 500)
+```
+
+```{r message=FALSE}
+topPathwaysUp <- fgseaRes[ES > 0][head(order(pval), n=10), pathway]
+topPathwaysDown <- fgseaRes[ES < 0][head(order(pval), n=10), pathway]
+topPathways <- c(topPathwaysUp, rev(topPathwaysDown))
+plotGseaTable(keggSymbolMouse[topPathways], stats, fgseaRes, 
+                gseaParam=0.5)
+```
+
+```{r message=FALSE}
+topPathways
+```
+
+На самом деле странные пути, не понимаю как астма связана с кишками и селезенкой 0_0, но сам анализ вроде нормальный. 
+
+Не стать мне биологом:(
+
+
