@@ -1,0 +1,227 @@
+---
+title: "R Notebook"
+output:
+  html_document:
+    df_print: paged
+---
+
+## Homework 4: _deadline December 19th_
+
+
+For fourth homework you will need to chose one of recent scRNA-seq datasets and perform basic analysis:
+
+* Preprocessing: filtering out bad cells and normalization
+* UMAP + clustering
+* Marker selection for clusters
+
+
+__My dataset__: `GSM4407907`
+
+__Organism__: Mus musculus
+
+__Experiment__: [Single-Cell RNA-Sequencing From Mouse Incisor Reveals Dental Epithelial Cell-Type Specific Genes](https://www.frontiersin.org/articles/10.3389/fcell.2020.00841/full)
+
+__Что происходило__: Использовалось scRNAseq, чтобы прояснить гетерогенность типов зубных эпителиальных клеток.
+
+
+## Installing packages
+```{r, message=FALSE}
+if (!requireNamespace("Seurat", quietly = TRUE)) install.packages("Seurat")
+if (!requireNamespace("ggplot2", quietly = TRUE)) install.packages("ggplot2")
+if (!requireNamespace("MAST", quietly = TRUE)) BiocManager::install("MAST")
+if (!requireNamespace("dplyr", quietly = TRUE)) install.packages("dplyr")
+if (!requireNamespace("Matrix", quietly = TRUE)) install.packages("Matrix")
+
+```
+
+```{r setup, message=FALSE}
+library(Seurat)
+library(Matrix)
+library(MAST)
+library(ggplot2)
+library(dplyr)
+```
+
+## Loading the data
+```{r}
+data <- Read10X("GSM_data/")
+dim(data)
+```
+* 48816 генов
+* 6260 клеток
+
+__Распределение UMI__
+
+```{r}
+plotData <- data.frame(
+  umis <- colSums(data)
+)
+ggplot(data=plotData, aes(x=umis)) +
+  geom_histogram() + theme_bw()
+```
+
+## Фильтрация
+(Так как мы повторяем статью - здесь и далее будут использоваться параметры из статьи).
+
+
+```
+Genes expressed in <5 cells were not included; 6,260 cells were included in subsequent clustering.
+```
+```{r warning=FALSE}
+
+seurat <- CreateSeuratObject(data, min.cells = 5)
+dim(seurat)
+```
+Пока все совпадает:)
+
+```{r}
+FeatureScatter(seurat, "nCount_RNA", "nFeature_RNA") + scale_x_log10() + scale_y_log10()
+```
+
+
+Видна хорошая корреляция.
+
+Надо словить умирающие клетки.
+
+
+```{r}
+seurat[["percent.mt"]] <- PercentageFeatureSet(seurat, pattern = "^mt-")
+FeatureScatter(seurat, "nCount_RNA", "percent.mt") + scale_x_log10()
+FeatureScatter(seurat, "nFeature_RNA", "percent.mt") + scale_x_log10()
+```
+
+В текущем датасете скорее всего мало умирающих клеток, так как мало клеток, у которых высокий процент мтДНК. Значит у нас хороший датасет с хорошим качеством.
+
+По фичам фильтровать не буду - у нас их большое количество везде, по проценту митохондриальной РНК - пусть с 9% отсечкой - так как статья:
+
+```
+Сells, with a mean of >9% of UMIs mapped to mitochondrial genes, were defined as non-viable or apoptotic and were excluded from the analyses.
+```
+
+
+```{r}
+seurat <- subset(seurat, percent.mt < 9)
+dim(seurat)
+```
+35 клеточек выкинулось - не много. Какой хороший датасет!)
+
+## Нормализация
+
+`
+SCTransform does all of these things in one command.
+`
+
+Чудесно!
+
+```{r message = FALSE, warning=FALSE}
+seurat <- SCTransform(seurat, vars.to.regress = "percent.mt", verbose = FALSE)
+```
+
+## Вариабельные гены 
+(Гены, которые меняются не из-за кривого распределения UMI)
+
+```{r message=FALSE}
+top10_variable_genes <- head(VariableFeatures(seurat), 10)
+VariableFeaturePlot(seurat) %>% 
+  LabelPoints(points = top10_variable_genes, repel = TRUE) +
+  scale_y_log10()
+```
+
+Так как мы изучаем ameloblast - клетки, которые есть только при образовании зуба, то логично, что тут выделены гены, отвечающие, например, за захват ионов кальция, или formation of dental enamel. Гены действительно связано с биологией, которую смотрим
+
+## PCA
+
+
+```{r}
+seurat <- RunPCA(seurat, verbose = FALSE)
+ElbowPlot(seurat, ndims = 50)
+```
+
+Здесь надо будет выбрать, какую размерность мы берем. Наверное, наметанность галаз увеличивается с опытом. А я воспользуюсь статьей и возьму 15: 
+
+```
+The number of significant PCs for clustering analysis was determined by the “JackStraw” function implemented by the Seurat package at p < 0.05 with 15 PCs.
+```
+
+Ну вот, здесь использовали доп.метод чтобы понять, какую именно размерность брать. Так как авторы - люди умные, поверю им!
+
+## Visualization
+
+```{r}
+seurat <- RunTSNE(seurat, dims=1:15)
+```
+
+Но лучше заюзаем UMAP, так как он хорошо разносит на дистанции:
+
+```{r warning=FALSE, message=FALSE}
+seurat <- RunUMAP(seurat, dims=1:15)
+```
+Отобразим оба:
+
+```{r}
+DimPlot(seurat, reduction = "tsne") + NoLegend()
+DimPlot(seurat, reduction = "umap") + NoLegend()
+```
+
+Осталось кластеризовать клетки. Итак, буду использовать UMAP, так как он лучше группирует. А resolution = 0.2, потому что:
+
+```
+Cluster representations were performed by 
+t-distributed stochastic neighbor embedding (t-SNE) at resolution 0.2.
+```
+
+```{r}
+seurat <- FindNeighbors(seurat, dims = 1:15, verbose = FALSE)
+seurat <- FindClusters(seurat, resolution=0.2, verbose = FALSE)
+DimPlot(seurat, reduction = "tsne", label = TRUE) + NoLegend()
+DimPlot(seurat, reduction = "umap", label = TRUE) + NoLegend()
+```
+
+t-SNE сходится с авторами, но по мне: красивее выглядит UMAP.
+
+У нас есть популяции, но мы не знаем, что это за популяции. 
+
+Проаннотируем!
+
+## Аннотации
+Запустим DE:
+```{r message=FALSE, warning=FALSE}
+allMarkers <- FindAllMarkers(seurat, max.cells.per.ident = 100, test.use = "MAST", only.pos = T)
+goodMarkers <- allMarkers %>% group_by(cluster) %>% top_n(n = 1, wt = avg_logFC) %>% pull(gene)
+goodMarkers
+```
+
+Посмотрим на экспрессию в клетках:
+
+```{r}
+FeaturePlot(seurat, goodMarkers[1:9], cols=c("grey", "red"), reduction="umap", ncol=3)
+```
+
+```{r}
+VlnPlot(seurat, goodMarkers[1:9], pt.size = 0.3)
+```
+
+`Col1a2` - ubunit of the fibril-forming type I collagen, the most abundant protein of bone, skin and tendon extracellular matrices. Значит кластер 0 (в котором выделяется этот ген) - как раз и есть зубы и косточки. К сожалению, похожего в статье нет:(.
+
+`Ambn`  - encodes an extracellular matrix glycoprotein that is involved in the formation of dental enamel. Выделен у 1 и (немного) 2 кластера, в статье соотносится с ameloblast clusters - и оно как раз и выделяется в них (амелобластах), по утверждению ncbi:) Very nice!
+
+`tg-DsRed` (в статье клетки относятся к эпителию) - odinated thyroid hormones thyroxine. Синтезирует гормоны, по идее гормоны в эпителиальных клетках и синтезиуются (возможно, я не биолог). Тогда кластера 2,3,6 - чтото связанное с эпителием.
+
+`Hmgb2` - экспрессируется почти у всех, кроме 1 и 2. Но это какая-то high mobility group. Ничего полезного
+
+`Bglap` - Biomineralization. Хорошо экспрессируется у 4 и 5. Они - клетки костей (по утверждению юнипрота).
+
+`igfbp7` - insulin-like growth factor binding protein. Expressed at high levels in lung, kidney, small intestine, testis and uterus and at moderate levels in liver. Лол. Интересно, мы тут зубы как бы изучаем. Но зато в статье был другой ген, который тоже странный (может мой по аналогии привязать можно): Although the function of Cldn10 during tooth development has not reported yet, Cldn10 regulates ion permeability in kidney in mice (Breiderhoff et al., 2012). Cldn10 may contribute to ion permeability in SI cells and may play essential roles in enamel formation.
+
+О, это классно, так как 6 было связано с эпителием (правда 5 с чем-то костяным). Какой кошмар.
+
+`Tfrc` - на юнипроте оч много регуляций перечислено и ионного гомеостаза. Вобщем мемранный белок, и видимо он очень странно у 6го одного выбивается.
+
+`Mpz` - necessary for normal myelination in the peripheral nervous system. (его и похожих тоже нет в статье) в экспрессия повышена у 7го кластера. У 7го кластера повышено. Так как мы больше про 7 кластер не знаем ничего, то возможно это клетки нервов, которые были в зубах. (в статье подобного рода вещи не находили).
+
+`s100a8` - calcium- and zinc-binding protein which plays a prominent role in the regulation of inflammatory processes and immune response; экспрессия повышена у 0,1,2,6,8 кластеров. кластер 0, как упоминали в начале точно причастен к образованию зубов. Цинк тут необходим. 1 и 2 видимо тоже. 6 скорее всего связано с эпителием (выше) - интересно откуда тут кальций (хотя, может для построения тоже нужен). Про 8 особо не знаем:(
+
+__Вывод__
+Костя был прав, когда говорил, что для этой части нужен отдельный шарящий биолог:) - я не понимаю 0_0
+
+
